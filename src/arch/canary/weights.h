@@ -65,7 +65,7 @@ struct CanaryHParams {
     int32_t pad_token_id = -1;
 
     // Multitask special-token catalog. Read from stt.canary.special.* KV.
-    std::string prompt_format;  // "canary" or "canary2"
+    std::string prompt_format;  // "canary", "canary2", or "indic" (Indic-Transcribe Canary)
     int32_t     startoftranscript_id = -1;
     int32_t     startofcontext_id    = -1;
     int32_t     endoftext_id         = -1;
@@ -75,6 +75,10 @@ struct CanaryHParams {
     int32_t     nopnc_id             = -1;
     int32_t     itn_id               = -1;
     int32_t     noitn_id             = -1;
+    // Indic-Transcribe's extra output-mode slots: native script (default)
+    // uses <|noromanized|>; <|romanized|> selects Latin transliteration.
+    int32_t     romanized_id         = -1;
+    int32_t     noromanized_id       = -1;
     int32_t     timestamp_id         = -1;
     int32_t     notimestamp_id       = -1;
     int32_t     diarize_id           = -1;

@@ -691,6 +691,42 @@ std::vector<int32_t> build_prompt_canary2(const CanaryModel &   cm,
     return ids;
 }
 
+// Indic-Transcribe (Bodhan AI, based on nvidia/canary-1b-v2) uses a fixed
+// 10-token prompt per language, published verbatim in the checkpoint's
+// tokenizer_config.json:
+//   <|startofcontext|> <|startoftranscript|> <|emo:undefined|>
+//   <|LANG|> <|LANG|> <|pnc|> <|noitn|> <|noromanized|>
+//   <|notimestamp|> <|nodiarize|>
+// Unlike canary2 there is no leading decoder-context marker and an extra
+// output-mode slot (romanized) sits between ITN and timestamps. The native
+// script mode selected here is the only mode the Core checkpoint supports.
+std::vector<int32_t> build_prompt_indic(const CanaryModel &   cm,
+                                        const CanaryHParams & hp,
+                                        int                   lang_id) {
+    std::vector<int32_t> ids;
+    ids.reserve(10);
+
+    if (hp.startofcontext_id < 0 || hp.startoftranscript_id < 0 || lang_id < 0) {
+        return {};
+    }
+    const int emo_id = cm.tok.find("<|emo:undefined|>");
+    if (emo_id < 0 || hp.pnc_id < 0 || hp.noitn_id < 0 || hp.noromanized_id < 0 ||
+        hp.notimestamp_id < 0 || hp.nodiarize_id < 0) {
+        return {};
+    }
+    ids.push_back(hp.startofcontext_id);
+    ids.push_back(hp.startoftranscript_id);
+    ids.push_back(emo_id);
+    ids.push_back(lang_id);
+    ids.push_back(lang_id);
+    ids.push_back(hp.pnc_id);
+    ids.push_back(hp.noitn_id);
+    ids.push_back(hp.noromanized_id);
+    ids.push_back(hp.notimestamp_id);
+    ids.push_back(hp.nodiarize_id);
+    return ids;
+}
+
 // Transcript prefix ids for canary2: NeMo tokenizes the user_prefix turn on
 // its own with the target language's SentencePiece (BPE) tokenizer, so it
 // carries the dummy-prefix space. Aggregate tokenizers encode within that language's
@@ -1004,6 +1040,8 @@ transcribe_status run(transcribe_session *          session,
         prompt_ids = build_prompt_canary2(*cm, cm->hparams, src_id, tgt_id, task, pnc, prefix_ids);
     } else if (cm->hparams.prompt_format == "canary") {
         prompt_ids = build_prompt_canary(cm->hparams, src_id, tgt_id, task, pnc);
+    } else if (cm->hparams.prompt_format == "indic") {
+        prompt_ids = build_prompt_indic(*cm, cm->hparams, src_id);
     }
     if (prompt_ids.empty()) {
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "canary run: failed to build prompt for format='%s'",
@@ -1646,6 +1684,8 @@ transcribe_status run_batch(transcribe_session *          session,
         prompt_ids = build_prompt_canary2(*cm, hp, src_id, tgt_id, task, pnc, {});
     } else if (hp.prompt_format == "canary") {
         prompt_ids = build_prompt_canary(hp, src_id, tgt_id, task, pnc);
+    } else if (hp.prompt_format == "indic") {
+        prompt_ids = build_prompt_indic(*cm, hp, src_id);
     }
     if (prompt_ids.empty()) {
         return TRANSCRIBE_ERR_INVALID_ARG;

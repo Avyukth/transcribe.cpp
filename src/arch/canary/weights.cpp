@@ -192,6 +192,12 @@ transcribe_status read_canary_hparams(const gguf_context * gguf, CanaryHParams &
     if (auto st = opt_special("stt.canary.special.noitn_id", hp.noitn_id); st != TRANSCRIBE_OK) {
         return st;
     }
+    if (auto st = opt_special("stt.canary.special.romanized_id", hp.romanized_id); st != TRANSCRIBE_OK) {
+        return st;
+    }
+    if (auto st = opt_special("stt.canary.special.noromanized_id", hp.noromanized_id); st != TRANSCRIBE_OK) {
+        return st;
+    }
     if (auto st = opt_special("stt.canary.special.timestamp_id", hp.timestamp_id); st != TRANSCRIBE_OK) {
         return st;
     }
@@ -371,10 +377,10 @@ transcribe_status read_canary_hparams(const gguf_context * gguf, CanaryHParams &
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "canary: unsupported frontend pad_mode \"%s\"", hp.fe_pad_mode.c_str());
         return TRANSCRIBE_ERR_GGUF;
     }
-    if (hp.prompt_format != "canary" && hp.prompt_format != "canary2") {
+    if (hp.prompt_format != "canary" && hp.prompt_format != "canary2" && hp.prompt_format != "indic") {
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
                 "canary: unsupported prompt_format \"%s\" "
-                "(only \"canary\" and \"canary2\")",
+                "(only \"canary\", \"canary2\" and \"indic\")",
                 hp.prompt_format.c_str());
         return TRANSCRIBE_ERR_GGUF;
     }
