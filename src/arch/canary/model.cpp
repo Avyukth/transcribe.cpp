@@ -388,6 +388,12 @@ transcribe_status load(Loader & loader, const transcribe_model_load_params * par
                             m->hparams.prompt_format == "canary2" &&
                                 (m->hparams.tokenizer_single_sp || !m->hparams.tok_lang_codes.empty()));
 
+    // Indic-Transcribe GGUFs select mixed-script output through the itn slot,
+    // so transcribe_run_params::itn is a real control there.
+    if (m->hparams.noromanized_id >= 0 && m->hparams.itn_id >= 0) {
+        transcribe::set_feature(m.get(), TRANSCRIBE_FEATURE_ITN, true);
+    }
+
     // Publish the input-length ceiling now that the encoder positional span
     // and frontend rate are known (apply_family_invariants ran before the
     // hparams were read). The encoder is the binding INPUT limit for canary.
@@ -590,9 +596,50 @@ std::vector<int32_t> build_prompt_canary(const CanaryHParams & hp,
 
 // Ids the canary2 template emits besides the transcript prefix (see
 // build_prompt_canary2): nine task slots, plus the empty decoder-context
-// marker on single-SP tokenizers.
+// marker on single-SP tokenizers, plus the romanized slot on Indic-Transcribe.
 int canary2_base_prompt_tokens(const CanaryHParams & hp) {
-    return hp.tokenizer_single_sp ? 10 : 9;
+    return (hp.tokenizer_single_sp ? 10 : 9) + (hp.noromanized_id >= 0 ? 1 : 0);
+}
+
+// "te-Latn" asks an Indic-Transcribe model for romanized output; the
+// language token is still the base code's.
+bool is_latn_request(const char * lang) {
+    if (lang == nullptr) {
+        return false;
+    }
+    const size_t n = std::strlen(lang);
+    return n > 5 && std::strcmp(lang + n - 5, "-Latn") == 0;
+}
+
+// Output-mode slots for this run. Stock canary: always <|noitn|>, no
+// romanized slot. Indic-Transcribe: the GGUF's default_mode, overridden by
+// transcribe_run_params::itn (ON = mixed, OFF = not mixed) and by a
+// "-Latn" language suffix (romanized).
+struct CanaryOutputMode {
+    bool itn       = false;
+    bool romanized = false;
+};
+
+CanaryOutputMode canary_output_mode(const CanaryHParams & hp, const transcribe_run_params * params) {
+    CanaryOutputMode m;
+    if (hp.noromanized_id < 0) {
+        return m;
+    }
+    m.itn       = hp.default_mode == "mixed";
+    m.romanized = hp.default_mode == "romanized";
+    if (params != nullptr) {
+        if (params->itn == TRANSCRIBE_ITN_MODE_ON) {
+            m.itn       = true;
+            m.romanized = false;
+        } else if (params->itn == TRANSCRIBE_ITN_MODE_OFF) {
+            m.itn = false;
+        }
+        if (is_latn_request(params->language)) {
+            m.itn       = false;
+            m.romanized = true;
+        }
+    }
+    return m;
 }
 
 // The decoder prompt is prefilled into the self-KV cache, so it must fit the
@@ -628,7 +675,8 @@ std::vector<int32_t> build_prompt_canary2(const CanaryModel &   cm,
                                           int                   tgt_lang_id,
                                           const char * /*task*/,
                                           bool                         pnc,
-                                          const std::vector<int32_t> & prefix_ids) {
+                                          const std::vector<int32_t> & prefix_ids,
+                                          CanaryOutputMode             mode = {}) {
     // canary2 prompt template:
     //   <|startofcontext|> [decodercontext] <|startoftranscript|>
     //   <|emo:?|> <|src_lang|> <|tgt_lang|> <|pnc|> <|itn|> <|timestamp|> <|diarize|>
@@ -672,10 +720,19 @@ std::vector<int32_t> build_prompt_canary2(const CanaryModel &   cm,
     }
     ids.push_back(pnc_slot);
 
-    if (hp.noitn_id < 0) {
+    const int itn_slot = mode.itn ? hp.itn_id : hp.noitn_id;
+    if (itn_slot < 0) {
         return {};
     }
-    ids.push_back(hp.noitn_id);
+    ids.push_back(itn_slot);
+
+    if (hp.noromanized_id >= 0) {
+        const int rom_slot = mode.romanized ? hp.romanized_id : hp.noromanized_id;
+        if (rom_slot < 0) {
+            return {};
+        }
+        ids.push_back(rom_slot);
+    }
 
     if (hp.notimestamp_id < 0) {
         return {};
@@ -702,15 +759,20 @@ std::vector<int32_t> build_prompt_canary2(const CanaryModel &   cm,
 // script mode selected here is the only mode the Core checkpoint supports.
 std::vector<int32_t> build_prompt_indic(const CanaryModel &   cm,
                                         const CanaryHParams & hp,
-                                        int                   lang_id) {
+                                        int                   lang_id,
+                                        bool                  pnc,
+                                        CanaryOutputMode      mode = {}) {
     std::vector<int32_t> ids;
     ids.reserve(10);
 
     if (hp.startofcontext_id < 0 || hp.startoftranscript_id < 0 || lang_id < 0) {
         return {};
     }
-    const int emo_id = cm.tok.find("<|emo:undefined|>");
-    if (emo_id < 0 || hp.pnc_id < 0 || hp.noitn_id < 0 || hp.noromanized_id < 0 ||
+    const int emo_id   = cm.tok.find("<|emo:undefined|>");
+    const int pnc_slot = pnc ? hp.pnc_id : hp.nopnc_id;
+    const int itn_slot = mode.itn ? hp.itn_id : hp.noitn_id;
+    const int rom_slot = mode.romanized ? hp.romanized_id : hp.noromanized_id;
+    if (emo_id < 0 || pnc_slot < 0 || itn_slot < 0 || rom_slot < 0 ||
         hp.notimestamp_id < 0 || hp.nodiarize_id < 0) {
         return {};
     }
@@ -719,9 +781,9 @@ std::vector<int32_t> build_prompt_indic(const CanaryModel &   cm,
     ids.push_back(emo_id);
     ids.push_back(lang_id);
     ids.push_back(lang_id);
-    ids.push_back(hp.pnc_id);
-    ids.push_back(hp.noitn_id);
-    ids.push_back(hp.noromanized_id);
+    ids.push_back(pnc_slot);
+    ids.push_back(itn_slot);
+    ids.push_back(rom_slot);
     ids.push_back(hp.notimestamp_id);
     ids.push_back(hp.nodiarize_id);
     return ids;
@@ -766,6 +828,10 @@ transcribe_status encode_canary2_prefix(const CanaryModel &    cm,
 int find_language_id(const CanaryHParams & hp, const char * lang) {
     if (lang == nullptr) {
         return -1;
+    }
+    if (hp.noromanized_id >= 0 && is_latn_request(lang)) {
+        const std::string base(lang, std::strlen(lang) - 5);
+        return find_language_id(hp, base.c_str());
     }
     for (size_t i = 0; i < hp.languages.size() && i < hp.language_ids.size(); ++i) {
         if (hp.languages[i] == lang) {
@@ -1037,11 +1103,12 @@ transcribe_status run(transcribe_session *          session,
             st != TRANSCRIBE_OK) {
             return st;
         }
-        prompt_ids = build_prompt_canary2(*cm, cm->hparams, src_id, tgt_id, task, pnc, prefix_ids);
+        prompt_ids = build_prompt_canary2(*cm, cm->hparams, src_id, tgt_id, task, pnc, prefix_ids,
+                                          canary_output_mode(cm->hparams, params));
     } else if (cm->hparams.prompt_format == "canary") {
         prompt_ids = build_prompt_canary(cm->hparams, src_id, tgt_id, task, pnc);
     } else if (cm->hparams.prompt_format == "indic") {
-        prompt_ids = build_prompt_indic(*cm, cm->hparams, src_id);
+        prompt_ids = build_prompt_indic(*cm, cm->hparams, src_id, pnc, canary_output_mode(cm->hparams, params));
     }
     if (prompt_ids.empty()) {
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "canary run: failed to build prompt for format='%s'",
@@ -1681,11 +1748,11 @@ transcribe_status run_batch(transcribe_session *          session,
     }
     std::vector<int32_t> prompt_ids;
     if (hp.prompt_format == "canary2") {
-        prompt_ids = build_prompt_canary2(*cm, hp, src_id, tgt_id, task, pnc, {});
+        prompt_ids = build_prompt_canary2(*cm, hp, src_id, tgt_id, task, pnc, {}, canary_output_mode(hp, params));
     } else if (hp.prompt_format == "canary") {
         prompt_ids = build_prompt_canary(hp, src_id, tgt_id, task, pnc);
     } else if (hp.prompt_format == "indic") {
-        prompt_ids = build_prompt_indic(*cm, hp, src_id);
+        prompt_ids = build_prompt_indic(*cm, hp, src_id, pnc, canary_output_mode(hp, params));
     }
     if (prompt_ids.empty()) {
         return TRANSCRIBE_ERR_INVALID_ARG;

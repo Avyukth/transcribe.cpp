@@ -79,6 +79,9 @@ struct CanaryHParams {
     // uses <|noromanized|>; <|romanized|> selects Latin transliteration.
     int32_t     romanized_id         = -1;
     int32_t     noromanized_id       = -1;
+    // Output mode used when the caller leaves itn at DEFAULT:
+    // "native" (noitn, noromanized), "mixed" (itn), "romanized".
+    std::string default_mode         = "native";
     int32_t     timestamp_id         = -1;
     int32_t     notimestamp_id       = -1;
     int32_t     diarize_id           = -1;
