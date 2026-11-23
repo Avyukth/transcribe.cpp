@@ -394,6 +394,13 @@ transcribe_status load(Loader & loader, const transcribe_model_load_params * par
         transcribe::set_feature(m.get(), TRANSCRIBE_FEATURE_ITN, true);
     }
 
+    // Indic-Transcribe checkpoints support built-in 1-step language detection
+    // from the 3-token prompt head ([<|startofcontext|>, <|startoftranscript|>,
+    // <|emo:undefined|>]), reusing the encoder output.
+    if (m->hparams.noromanized_id >= 0 && !m->hparams.languages.empty()) {
+        m->caps.supports_language_detect = true;
+    }
+
     // Publish the input-length ceiling now that the encoder positional span
     // and frontend rate are known (apply_family_invariants ran before the
     // hparams were read). The encoder is the binding INPUT limit for canary.
@@ -657,6 +664,10 @@ transcribe_status check_prompt_fits(int prompt_len, int ceiling) {
         return TRANSCRIBE_ERR_INVALID_ARG;
     }
     return TRANSCRIBE_OK;
+}
+
+bool is_auto_language(const char * lang) {
+    return lang == nullptr || lang[0] == '\0' || std::strcmp(lang, "auto") == 0;
 }
 
 // Target language of a run: the explicit target when translating, else the
@@ -1046,31 +1057,40 @@ transcribe_status run(transcribe_session *          session,
     cc->enc_host.resize(static_cast<size_t>(d_dec) * static_cast<size_t>(T_enc));
     ggml_backend_tensor_get(eb.out, cc->enc_host.data(), 0, cc->enc_host.size() * sizeof(float));
 
-    // Build multitask prompt.
-    const char * lang         = (params && params->language) ? params->language : "en";
-    const bool   is_translate = (params != nullptr && params->task == TRANSCRIBE_TASK_TRANSLATE);
-    const char * tgt_lang     = canary_target_language(params);
-    const char * task         = is_translate ? "translate" : "asr";
+    // Build multitask prompt (or defer when running 1-step Indic Auto LID).
+    const bool        is_translate = (params != nullptr && params->task == TRANSCRIBE_TASK_TRANSLATE);
+    const char *      task         = is_translate ? "translate" : "asr";
+    const bool        run_lid      = cm->hparams.noromanized_id >= 0 && !is_translate &&
+                                     is_auto_language(params ? params->language : nullptr);
+    std::string       resolved_lang;
+    std::string       detected_lang;
+    const char *      lang         = (params && params->language && params->language[0] != '\0') ? params->language : "en";
+    const char *      tgt_lang     = canary_target_language(params);
+    int               src_id       = -1;
+    int               tgt_id       = -1;
 
-    const int src_id = find_language_id(cm->hparams, lang);
-    const int tgt_id = find_language_id(cm->hparams, tgt_lang);
-    if (src_id < 0) {
-        log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
-                "canary run: source language '%s' has no token id "
-                "(model supports %zu langs)",
-                lang, cm->hparams.languages.size());
-        return TRANSCRIBE_ERR_UNSUPPORTED_LANGUAGE;
-    }
-    if (tgt_id < 0) {
-        log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
-                "canary run: target language '%s' has no token id "
-                "(model supports %zu langs)",
-                tgt_lang, cm->hparams.languages.size());
-        return TRANSCRIBE_ERR_UNSUPPORTED_LANGUAGE;
-    }
-    if (is_translate && !translation_pair_allowed(cm->hparams, lang, tgt_lang)) {
-        log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "canary run: translation pair '%s>%s' is not advertised", lang, tgt_lang);
-        return TRANSCRIBE_ERR_UNSUPPORTED_LANGUAGE;
+    if (!run_lid) {
+        src_id = find_language_id(cm->hparams, lang);
+        tgt_id = find_language_id(cm->hparams, tgt_lang);
+        if (src_id < 0) {
+            log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
+                    "canary run: source language '%s' has no token id "
+                    "(model supports %zu langs)",
+                    lang, cm->hparams.languages.size());
+            return TRANSCRIBE_ERR_UNSUPPORTED_LANGUAGE;
+        }
+        if (tgt_id < 0) {
+            log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
+                    "canary run: target language '%s' has no token id "
+                    "(model supports %zu langs)",
+                    tgt_lang, cm->hparams.languages.size());
+            return TRANSCRIBE_ERR_UNSUPPORTED_LANGUAGE;
+        }
+        if (is_translate && !translation_pair_allowed(cm->hparams, lang, tgt_lang)) {
+            log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "canary run: translation pair '%s>%s' is not advertised", lang,
+                    tgt_lang);
+            return TRANSCRIBE_ERR_UNSUPPORTED_LANGUAGE;
+        }
     }
 
     // Generic transcribe_run_params::pnc routes here. DEFAULT maps to the
@@ -1097,29 +1117,38 @@ transcribe_status run(transcribe_session *          session,
 
     std::vector<int32_t> prompt_ids;
     std::vector<int32_t> prefix_ids;
-    if (cm->hparams.prompt_format == "canary2") {
-        if (const transcribe_status st =
-                encode_canary2_prefix(*cm, params != nullptr ? params->prefix : nullptr, tgt_lang, prefix_ids);
+    auto build_prompt_for = [&](int s_id, int t_id, const char * t_lang,
+                                std::vector<int32_t> & out_prompt) -> transcribe_status {
+        out_prompt.clear();
+        prefix_ids.clear();
+        if (cm->hparams.prompt_format == "canary2") {
+            if (const transcribe_status st =
+                    encode_canary2_prefix(*cm, params != nullptr ? params->prefix : nullptr, t_lang, prefix_ids);
+                st != TRANSCRIBE_OK) {
+                return st;
+            }
+            out_prompt = build_prompt_canary2(*cm, cm->hparams, s_id, t_id, task, pnc, prefix_ids,
+                                              canary_output_mode(cm->hparams, params));
+        } else if (cm->hparams.prompt_format == "canary") {
+            out_prompt = build_prompt_canary(cm->hparams, s_id, t_id, task, pnc);
+        } else if (cm->hparams.prompt_format == "indic") {
+            out_prompt =
+                build_prompt_indic(*cm, cm->hparams, s_id, pnc, canary_output_mode(cm->hparams, params));
+        }
+        if (out_prompt.empty()) {
+            log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "canary run: failed to build prompt for format='%s'",
+                    cm->hparams.prompt_format.c_str());
+            return TRANSCRIBE_ERR_INVALID_ARG;
+        }
+        return check_prompt_fits(static_cast<int>(out_prompt.size()),
+                                 canary_context_ceiling(cc->n_ctx, cm->hparams));
+    };
+
+    if (!run_lid) {
+        if (const transcribe_status st = build_prompt_for(src_id, tgt_id, tgt_lang, prompt_ids);
             st != TRANSCRIBE_OK) {
             return st;
         }
-        prompt_ids = build_prompt_canary2(*cm, cm->hparams, src_id, tgt_id, task, pnc, prefix_ids,
-                                          canary_output_mode(cm->hparams, params));
-    } else if (cm->hparams.prompt_format == "canary") {
-        prompt_ids = build_prompt_canary(cm->hparams, src_id, tgt_id, task, pnc);
-    } else if (cm->hparams.prompt_format == "indic") {
-        prompt_ids = build_prompt_indic(*cm, cm->hparams, src_id, pnc, canary_output_mode(cm->hparams, params));
-    }
-    if (prompt_ids.empty()) {
-        log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "canary run: failed to build prompt for format='%s'",
-                cm->hparams.prompt_format.c_str());
-        return TRANSCRIBE_ERR_INVALID_ARG;
-    }
-    const int prompt_len = static_cast<int>(prompt_ids.size());
-    // Backstop for run_validate's pre-clear bound: never prefill past the KV.
-    if (const transcribe_status st = check_prompt_fits(prompt_len, canary_context_ceiling(cc->n_ctx, cm->hparams));
-        st != TRANSCRIBE_OK) {
-        return st;
     }
 
     // Init KV cache.
@@ -1210,6 +1239,108 @@ transcribe_status run(transcribe_session *          session,
         cc->kv_cache.cross_populated = true;
     }
 
+    // Optional 1-step built-in Indic-Transcribe language detection: feed the
+    // 3-token prompt head ([<|startofcontext|>, <|startoftranscript|>,
+    // <|emo:undefined|>]) and take argmax over the model's language tokens,
+    // reusing the cross-KV computed above.
+    if (run_lid) {
+        std::vector<int32_t> lid_ids;
+        const int            emo_id = cm->tok.find("<|emo:undefined|>");
+        if (cm->hparams.startofcontext_id < 0 || cm->hparams.startoftranscript_id < 0 || emo_id < 0) {
+            return TRANSCRIBE_ERR_GGUF;
+        }
+        if (cm->hparams.prompt_format == "canary2" && cm->hparams.tokenizer_single_sp) {
+            const int sp_space_id = cm->tok.find("\xe2\x96\x81");
+            if (sp_space_id < 0) {
+                return TRANSCRIBE_ERR_GGUF;
+            }
+            lid_ids.push_back(sp_space_id);
+        }
+        lid_ids.push_back(cm->hparams.startofcontext_id);
+        lid_ids.push_back(cm->hparams.startoftranscript_id);
+        lid_ids.push_back(emo_id);
+        const int lid_len = static_cast<int>(lid_ids.size());
+
+        if (!new_compute_ctx(4 * 1024 * 1024)) {
+            return TRANSCRIBE_ERR_OOM;
+        }
+        DecoderBuild lid_db = build_decoder_graph_kv(cc->compute_ctx, cm->weights, cm->hparams, cc->kv_cache, lid_len,
+                                                     /*n_past=*/0, T_enc,
+                                                     /*skip_log_softmax=*/true, cc->decoder_use_flash);
+        if (lid_db.out == nullptr || lid_db.graph == nullptr) {
+            return TRANSCRIBE_ERR_GGUF;
+        }
+        ggml_backend_sched_reset(cc->sched);
+        if (!TRANSCRIBE_ALLOC_SCHED_GRAPH(cc->sched, lid_db.graph, "canary")) {
+            return TRANSCRIBE_ERR_OOM;
+        }
+        ggml_backend_tensor_set(lid_db.token_ids_in, lid_ids.data(), 0, lid_ids.size() * sizeof(int32_t));
+        std::vector<int32_t> lid_pos(lid_len);
+        for (int i = 0; i < lid_len; ++i) {
+            lid_pos[i] = i;
+        }
+        ggml_backend_tensor_set(lid_db.pos_ids_in, lid_pos.data(), 0, lid_pos.size() * sizeof(int32_t));
+        if (lid_len > 1) {
+            if (ggml_tensor * mask_input = find_mask_input(); mask_input != nullptr) {
+                std::vector<float> mask_data(static_cast<size_t>(lid_len) * lid_len);
+                for (int q = 0; q < lid_len; ++q) {
+                    for (int k = 0; k < lid_len; ++k) {
+                        mask_data[static_cast<size_t>(q) * lid_len + k] = (k <= q) ? 0.0f : -1e9f;
+                    }
+                }
+                ggml_backend_tensor_set(mask_input, mask_data.data(), 0, mask_data.size() * sizeof(float));
+            }
+        }
+        if (const ggml_status gs = ggml_backend_sched_graph_compute(cc->sched, lid_db.graph);
+            gs != GGML_STATUS_SUCCESS) {
+            log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "canary lid: compute failed (%d)", static_cast<int>(gs));
+            return TRANSCRIBE_ERR_BACKEND;
+        }
+        const int64_t      vocab_size = lid_db.out->ne[0];
+        std::vector<float> logits_host(static_cast<size_t>(vocab_size) * lid_len);
+        ggml_backend_tensor_get(lid_db.out, logits_host.data(), 0, logits_host.size() * sizeof(float));
+        const float * last_logits = logits_host.data() + static_cast<size_t>(lid_len - 1) * vocab_size;
+
+        // Pick argmax over trained languages, skipping Bodhan's known sink
+        // classes (bgc, bhb) when other candidates exist.
+        int   best_idx   = -1;
+        float best_score = -1e30f;
+        for (size_t i = 0; i < cm->hparams.languages.size() && i < cm->hparams.language_ids.size(); ++i) {
+            const std::string & code = cm->hparams.languages[i];
+            const int32_t       tid  = cm->hparams.language_ids[i];
+            if (tid < 0 || tid >= vocab_size || is_latn_request(code.c_str())) {
+                continue;
+            }
+            if ((code == "bgc" || code == "bhb") && cm->hparams.languages.size() > 2) {
+                continue;
+            }
+            if (last_logits[tid] > best_score) {
+                best_score = last_logits[tid];
+                best_idx   = static_cast<int>(i);
+            }
+        }
+        if (best_idx < 0) {
+            return TRANSCRIBE_ERR_UNSUPPORTED_LANGUAGE;
+        }
+        resolved_lang = cm->hparams.languages[static_cast<size_t>(best_idx)];
+        detected_lang = resolved_lang;
+        src_id        = cm->hparams.language_ids[static_cast<size_t>(best_idx)];
+        tgt_id        = src_id;
+        lang          = resolved_lang.c_str();
+        tgt_lang      = lang;
+        log_msg(TRANSCRIBE_LOG_LEVEL_INFO, "canary lid: detected language '%s' (id=%d, logit=%.3f)", lang, src_id,
+                best_score);
+
+        // Reset self-KV (keeping cross-KV populated) before full prompt prefill.
+        cc->kv_cache.n    = 0;
+        cc->kv_cache.head = 0;
+        if (const transcribe_status st = build_prompt_for(src_id, tgt_id, tgt_lang, prompt_ids);
+            st != TRANSCRIBE_OK) {
+            return st;
+        }
+    }
+    const int prompt_len = static_cast<int>(prompt_ids.size());
+
     // Prompt pass + autoregressive decode.
     {
         if (!new_compute_ctx(4 * 1024 * 1024)) {
@@ -1288,6 +1419,9 @@ transcribe_status run(transcribe_session *          session,
         cc->kv_cache.head = prompt_len;
 
         cc->clear_result();
+        if (!detected_lang.empty()) {
+            cc->detected_language = detected_lang;
+        }
 
         const int eos_id = cm->hparams.eos_token_id;
         const int max_tokens =
@@ -1730,6 +1864,9 @@ transcribe_status run_batch(transcribe_session *          session,
     const int    n_layer = hp.dec_n_layers;
 
     // Shared multitask prompt (identical across the batch).
+    if (hp.noromanized_id >= 0 && is_auto_language(params ? params->language : nullptr)) {
+        return run_batch_serial(cc, pcm, n_samples, n, params);
+    }
     const char * lang         = (params && params->language) ? params->language : "en";
     const bool   is_translate = (params != nullptr && params->task == TRANSCRIBE_TASK_TRANSLATE);
     const char * tgt_lang     = canary_target_language(params);
