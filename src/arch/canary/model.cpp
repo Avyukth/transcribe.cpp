@@ -1305,6 +1305,8 @@ transcribe_status run(transcribe_session *          session,
         // classes (bgc, bhb) when other candidates exist.
         int   best_idx   = -1;
         float best_score = -1e30f;
+        int   hi_idx     = -1;
+        float hi_score   = -1e30f;
         for (size_t i = 0; i < cm->hparams.languages.size() && i < cm->hparams.language_ids.size(); ++i) {
             const std::string & code = cm->hparams.languages[i];
             const int32_t       tid  = cm->hparams.language_ids[i];
@@ -1314,13 +1316,28 @@ transcribe_status run(transcribe_session *          session,
             if ((code == "bgc" || code == "bhb") && cm->hparams.languages.size() > 2) {
                 continue;
             }
-            if (last_logits[tid] > best_score) {
-                best_score = last_logits[tid];
+            const float score = last_logits[tid];
+            if (code == "hi") {
+                hi_idx   = static_cast<int>(i);
+                hi_score = score;
+            }
+            if (score > best_score) {
+                best_score = score;
                 best_idx   = static_cast<int>(i);
             }
         }
         if (best_idx < 0) {
             return TRANSCRIBE_ERR_UNSUPPORTED_LANGUAGE;
+        }
+        // Spoken Hindi and Urdu are acoustically near-identical; when Urdu wins
+        // by a narrow margin over Hindi, prefer Devanagari Hindi so Auto mode
+        // does not flip spoken Hindi into Perso-Arabic script.
+        if (cm->hparams.languages[static_cast<size_t>(best_idx)] == "ur" && hi_idx >= 0 &&
+            (best_score - hi_score) <= 2.5f) {
+            log_msg(TRANSCRIBE_LOG_LEVEL_INFO,
+                    "canary lid: preferring 'hi' (logit=%.3f) over close 'ur' (logit=%.3f)", hi_score, best_score);
+            best_idx   = hi_idx;
+            best_score = hi_score;
         }
         resolved_lang = cm->hparams.languages[static_cast<size_t>(best_idx)];
         detected_lang = resolved_lang;
